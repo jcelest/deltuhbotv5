@@ -136,9 +136,9 @@ def backfill_data(ticker: str, start_date: str, end_date: str):
 
 # ─── MAIN ENTRYPOINT ────────────────────────────────────────────
 if __name__ == "__main__":
-    ticker_to_backfill = "QQQ"
+    ticker_to_backfill = "PLTR"
     start_date         = "2025-06-20"
-    end_date           = "2025-06-27"
+    end_date           = "2025-06-26"
 
     if not POLYGON_API_KEY:
         raise ValueError("Polygon API Key not found in environment.")
