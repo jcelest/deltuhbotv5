@@ -1,111 +1,146 @@
-import websocket
-import json
-import os
+#!/usr/bin/env python
+import sys
 import time
+import traceback
+import json
+import websocket
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone
 
-# --- CONFIGURATION ---
-DB_NAME = "darkpool_data"
-DB_USER = "trader"
-DB_PASS = "Deltuhdarkpools!7" # Your password
-DB_HOST = "localhost"
-DB_PORT = "5432"
-POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY')
-SOCKET_URL = "wss://delayed.polygon.io/stocks"
+# ─── CONFIG ─────────────────────────────────────────────────────
+POLY_KEY   = "29k_KtZDxzDgsNlnfUyutIa2ibYCTIpD"
+DB_NAME    = "darkpool_data"
+DB_USER    = "trader"
+DB_PASS    = "Deltuhdarkpools!7"
+DB_HOST    = "localhost"
+DB_PORT    = "5432"
 
+SOCKET_URL       = "wss://delayed.polygon.io/stocks"
+MIN_VALUE        = 1_000_000   # only keep trades ≥ $1 000 000
+RAW_SAMPLE_EVERY = 25_000      # only print raw JSON every N batches
 
-class TradeHandler:
-    """A class to handle WebSocket events and database interactions."""
+# ─── DB ────────────────────────────────────────────────────────
+def get_db():
+    try:
+        return psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+    except psycopg2.OperationalError as e:
+        print(f"‼ Unable to connect to Postgres as {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+        print(f"   {e}")
+        sys.exit(1)
 
+# ─── HANDLER ──────────────────────────────────────────────────
+class Handler:
     def __init__(self, api_key):
-        self._api_key = api_key
-        self._db_conn = None
+        if not api_key:
+            raise RuntimeError("POLY_KEY is missing")
+        self.api_key   = api_key
+        self.conn      = None
+        self.raw_count = 0
 
     def _connect_db(self):
-        """Establishes and returns a database connection."""
-        if self._db_conn is None or self._db_conn.closed:
-            print("Connecting to database...")
-            self._db_conn = psycopg2.connect(
-                dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT
-            )
-        return self._db_conn
-
-    def _insert_trade(self, trade_data):
-        """Inserts a single trade into the block_trades table."""
-        trade_value = trade_data.get('s', 0) * trade_data.get('p', 0)
-        if trade_data.get('s', 0) < 10000 and trade_value < 200000:
-            return
-
-        sql = """
-            INSERT INTO block_trades (ticker, trade_time, price, quantity, trade_value, conditions)
-            VALUES (%s, %s, %s, %s, %s, %s);
-        """
-        trade_timestamp = datetime.fromtimestamp(trade_data.get('t') / 1000.0)
-
-        try:
-            conn = self._connect_db()
-            with conn.cursor() as cur:
-                cur.execute(sql, (
-                    trade_data.get('sym'), trade_timestamp, trade_data.get('p'),
-                    trade_data.get('s'), trade_value, trade_data.get('c')
-                ))
-            conn.commit()
-            print(f"SAVED >> Ticker: {trade_data.get('sym')}, Value: ${trade_value:,.2f}")
-        except Exception as e:
-            print(f"Database insert error: {e}")
-            if self._db_conn:
-                self._db_conn.rollback()
-
-    # --- WebSocket Event Handler Methods ---
-
-    def on_message(self, ws, message):
-        data = json.loads(message)
-        for trade in data:
-            if trade.get('ev') == 'T':
-                self._insert_trade(trade)
-
-    def on_error(self, ws, error):
-        print(f"Error: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        print("WebSocket connection closed.")
-        if self._db_conn:
-            self._db_conn.close()
-            print("Database connection closed on exit.")
+        if not self.conn or self.conn.closed:
+            self.conn = get_db()
+        return self.conn
 
     def on_open(self, ws):
-        print("WebSocket connection opened.")
-        auth_data = {"action": "auth", "params": self._api_key}
-        ws.send(json.dumps(auth_data))
-        
-        # Change this line to subscribe to the full feed when you have a paid plan
-        sub_data = {"action": "subscribe", "params": "T.SPY,T.AAPL,T.MSFT"}
-        ws.send(json.dumps(sub_data))
-        print(f"Authenticated and subscribed to: {sub_data['params']}")
+        # authenticate & subscribe
+        ws.send(json.dumps({"action": "auth",      "params": self.api_key}))
+        ws.send(json.dumps({"action": "subscribe", "params": "T.*"}))
+        print("▶ WS open; subscribed to T.*")
+
+    def on_message(self, ws, message):
+        self.raw_count += 1
+        if self.raw_count % RAW_SAMPLE_EVERY == 0:
+            print(f"\n[RAW #{self.raw_count}] {message}\n")
+
+        try:
+            batch = json.loads(message)
+        except json.JSONDecodeError:
+            print("‼ Couldn't parse JSON")
+            return
+
+        for trade in batch:
+            if trade.get("ev") != "T":
+                continue
+
+            size  = trade.get("s", 0)
+            price = trade.get("p", 0.0)
+            value = size * price
+
+            # only keep trades ≥ MIN_VALUE
+            if value < MIN_VALUE:
+                continue
+
+            # dark‐pool filter: exchange==4 + has a TRF facility
+            if trade.get("x") != 4 or trade.get("trfi") is None:
+                continue
+
+            # use the official TRF timestamp (trft) as your trade_time
+            ts_ms = trade.get("trft")
+            if ts_ms is None:
+                continue
+            dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+
+            try:
+                conn = self._connect_db()
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO block_trades
+                          (trade_time, ticker, price, quantity, trade_value,
+                           conditions, exchange, trf_id, trf_timestamp)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING;
+                    """, (
+                        dt,
+                        trade.get("sym"),
+                        price,
+                        size,
+                        value,
+                        trade.get("c", []),
+                        trade.get("x"),
+                        trade.get("trfi"),
+                        ts_ms,
+                    ))
+                conn.commit()
+
+                print(
+                    f"✔ Saved {trade['sym']} "
+                    f"{size}@{price:.2f} (value={value:.0f}) "
+                    f"exchange={trade['x']} trf_id={trade['trfi']} "
+                    f"at {dt.isoformat()}"
+                )
+            except Exception:
+                traceback.print_exc()
+                if self.conn:
+                    self.conn.rollback()
+
+    def on_error(self, ws, error):
+        print("‼ WS error:", error)
+
+    def on_close(self, ws, code, msg):
+        print(f"⏹ WS closed: code={code} msg={msg}")
+        if self.conn:
+            self.conn.close()
 
     def run(self):
-        """Starts the WebSocket connection and runs forever."""
-        print("Starting Data Ingestor...")
-        ws = websocket.WebSocketApp(
-            SOCKET_URL,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        ws.run_forever()
-
-
-if __name__ == "__main__":
-    if not POLYGON_API_KEY:
-        raise ValueError("Polygon API Key not found. Set the POLYGON_API_KEY environment variable.")
-
-    # Loop to auto-reconnect if the connection drops
-    while True:
-        try:
-            handler = TradeHandler(api_key=POLYGON_API_KEY)
-            handler.run()
-        except Exception as e:
-            print(f"Main connection loop failed: {e}. Retrying in 10 seconds...")
+        while True:
+            ws = websocket.WebSocketApp(
+                SOCKET_URL,
+                on_open    = self.on_open,
+                on_message = self.on_message,
+                on_error   = self.on_error,
+                on_close   = self.on_close
+            )
+            ws.run_forever()
+            print("🔄 Disconnected—reconnecting in 10s…")
             time.sleep(10)
+
+# ─── MAIN ──────────────────────────────────────────────────────
+if __name__ == "__main__":
+    Handler(POLY_KEY).run()
