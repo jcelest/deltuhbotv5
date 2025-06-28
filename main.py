@@ -55,6 +55,7 @@ def shutdown():
     if _db_pool:
         _db_pool.closeall()
 
+
 def get_db_connection():
     if not _db_pool:
         raise RuntimeError("Connection pool not initialized")
@@ -140,11 +141,9 @@ def get_all_blocks(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (ticker.upper(), floor))
             return cur.fetchall()
-
     except Exception:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="DB error in allblocks")
-
     finally:
         release_db_connection(conn)
 
@@ -187,24 +186,26 @@ def get_all_dark_pool(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (ticker.upper(), floor))
             return cur.fetchall()
-
     except Exception:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="DB error in alldp")
-
     finally:
         release_db_connection(conn)
 
-# ─── bigprints: TOP-100 TODAY BY ET DATE ─────────────────────────
+# ─── bigprints: TOP-100 LAST X DAYS BY ET DATE ───────────────────────────
 @app.get(
     "/dp/bigprints",
     response_model=List[BlockTrade],
-    summary="Top 100 block trades by value for today"
+    summary="Top 100 block trades by value over the last X days"
 )
-def get_big_prints():
-    """
-    Top 100 prints for today’s NY date; no dynamic floor needed here.
-    """
+def get_big_prints(
+    days: int = Query(
+        1,
+        title="Days to look back",
+        description="Number of days to include in big prints (1–30)",
+        ge=1, le=30
+    )
+):
     conn = get_db_connection()
     try:
         sql = """
@@ -219,17 +220,15 @@ def get_big_prints():
             WHERE exchange      = 4
               AND trf_id     IS NOT NULL
               AND (trade_time AT TIME ZONE 'America/New_York')::date
-                    = (now() AT TIME ZONE 'America/New_York')::date
+                    >= (now() AT TIME ZONE 'America/New_York')::date - %s
             ORDER BY trade_value DESC
             LIMIT 100;
         """
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql)
+            cur.execute(sql, (days,))
             return cur.fetchall()
-
     except Exception:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="DB error in bigprints")
-
     finally:
         release_db_connection(conn)
