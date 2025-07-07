@@ -13,6 +13,7 @@ DB_PASS         = "Deltuhdarkpools!7"
 DB_HOST         = "localhost"
 DB_PORT         = "5432"
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY')
+TICKERS_FILE    = "tickers.txt"
 
 # ─── DB CONNECT ────────────────────────────────────────────────
 def get_db_connection():
@@ -27,12 +28,12 @@ def get_db_connection():
 # ─── BACKFILL FUNCTION ─────────────────────────────────────────
 def backfill_data(ticker: str, start_date: str, end_date: str):
     conn = get_db_connection()
-    print("Successfully connected to the database.")
+    print(f"Successfully connected to the database for ticker {ticker}.")
     print(f"Starting backfill for {ticker} from {start_date} to {end_date}...\n")
 
     # initial URL (will be replaced by next_url on pagination)
     next_url = (
-        f"https://api.polygon.io/v3/trades/{ticker.upper()}"
+        f"https://api.polygon.io/v3/trades/{ticker}"
         f"?timestamp.gte={start_date}&timestamp.lte={end_date}&limit=50000"
     )
 
@@ -41,25 +42,26 @@ def backfill_data(ticker: str, start_date: str, end_date: str):
     page_count       = 1
 
     while next_url:
-        print(f"--- Fetching Page {page_count} ---")
+        print(f"--- Fetching Page {page_count} for {ticker} ---")
         try:
             paginated = f"{next_url}&apiKey={POLYGON_API_KEY}"
             resp      = httpx.get(paginated, timeout=60.0)
             resp.raise_for_status()
             data      = resp.json()
         except Exception as e:
-            print(f"Error fetching data from Polygon: {e}")
+            print(f"Error fetching data for {ticker} from Polygon: {e}")
+            traceback.print_exc()
             break
 
         results = data.get("results", [])
         if not results:
-            print("No more trades for this range.\n")
+            print(f"No more trades for {ticker} in this range.\n")
             break
 
         total_downloaded += len(results)
 
         # sample-print first 5
-        print(f"  → Downloaded {len(results)} raw records; samples:")
+        print(f"  → Downloaded {len(results)} raw records for {ticker}; samples:")
         for i, trade in enumerate(results[:5]):
             ts_ns    = trade.get('participant_timestamp')
             time_str = (
@@ -104,7 +106,7 @@ def backfill_data(ticker: str, start_date: str, end_date: str):
                     """,
                     (
                         trade_time,
-                        ticker.upper(),
+                        ticker,
                         price,
                         quantity,
                         trade_value,
@@ -120,8 +122,9 @@ def backfill_data(ticker: str, start_date: str, end_date: str):
         conn.commit()
         total_saved += saved_on_page
 
-        print(f"  → Processed {len(results)} records, saved {saved_on_page} new block trades "
-              f"(total saved so far: {total_saved}).\n")
+        print(f"  → Processed {len(results)} records for {ticker}, "
+              f"saved {saved_on_page} new block trades "
+              f"(total saved so far for {ticker}: {total_saved}).\n")
 
         next_url = data.get("next_url")
         if next_url:
@@ -130,34 +133,42 @@ def backfill_data(ticker: str, start_date: str, end_date: str):
 
     print(f"Backfill complete for {ticker}:")
     print(f"  • Downloaded {total_downloaded} raw records")
-    print(f"  • Saved     {total_saved} valid block trades")
+    print(f"  • Saved     {total_saved} valid block trades\n")
     conn.close()
 
 
 # ─── MAIN ENTRYPOINT ────────────────────────────────────────────
 if __name__ == "__main__":
-    ticker_to_backfill = "PLTR"
-    start_date         = "2025-06-20"
-    end_date           = "2025-06-26"
+    start_date = "2025-06-20"
+    end_date   = "2025-06-26"
 
     if not POLYGON_API_KEY:
         raise ValueError("Polygon API Key not found in environment.")
 
-    # ─ Clear only the window you’re about to backfill ─────────────
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            print(f"Clearing {ticker_to_backfill.upper()} trades from {start_date} (inclusive) to {end_date} (exclusive)…")
-            cur.execute("""
-                DELETE FROM block_trades
-                 WHERE ticker     = %s
-                   AND trade_time >= %s::date
-                   AND trade_time <  (%s::date + INTERVAL '1 day');
-            """, (
-                ticker_to_backfill.upper(),
-                start_date,
-                end_date
-            ))
-        conn.commit()
-        print("Window cleared.\n")
+    # read tickers from file
+    try:
+        with open(TICKERS_FILE) as f:
+            tickers = [line.strip().upper() for line in f if line.strip()]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Tickers file '{TICKERS_FILE}' not found.")
 
-    backfill_data(ticker_to_backfill, start_date, end_date)
+    for ticker in tickers:
+        # clear only the window you’re about to backfill
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                print(f"Clearing {ticker} trades from {start_date} to {end_date}…")
+                cur.execute("""
+                    DELETE FROM block_trades
+                     WHERE ticker     = %s
+                       AND trade_time >= %s::date
+                       AND trade_time <  (%s::date + INTERVAL '1 day');
+                """, (
+                    ticker,
+                    start_date,
+                    end_date
+                ))
+            conn.commit()
+            print("Window cleared.\n")
+
+        # backfill this ticker
+        backfill_data(ticker, start_date, end_date)
