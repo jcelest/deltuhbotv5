@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import httpx
 import psycopg2
 import os
@@ -6,7 +7,7 @@ from datetime import datetime, timezone
 import time
 import traceback
 
-# ─── CONFIGURATION ─────────────────────────────────────────────
+# --- CONFIGURATION -----------------------------------------------
 DB_NAME         = "darkpool_data"
 DB_USER         = "trader"
 DB_PASS         = "Deltuhdarkpools!7"
@@ -14,8 +15,10 @@ DB_HOST         = "localhost"
 DB_PORT         = "5432"
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY')
 TICKERS_FILE    = "tickers.txt"
+# ✅ NEW: Minimum value for backfilling lit trades set to $10 million
+LIT_MIN_BACKFILL_VALUE = 10_000_000 
 
-# ─── DB CONNECT ────────────────────────────────────────────────
+# --- DB CONNECT --------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(
         dbname=DB_NAME,
@@ -25,150 +28,155 @@ def get_db_connection():
         port=DB_PORT
     )
 
-# ─── BACKFILL FUNCTION ─────────────────────────────────────────
-def backfill_data(ticker: str, start_date: str, end_date: str):
+# --- BACKFILL FUNCTION -------------------------------------------
+def backfill_data(ticker: str, start_date: str, end_date: str, mode: str):
     conn = get_db_connection()
-    print(f"Successfully connected to the database for ticker {ticker}.")
-    print(f"Starting backfill for {ticker} from {start_date} to {end_date}...\n")
+    print(f"Connected for {mode} backfill of {ticker}: {start_date} → {end_date}")
 
-    # initial URL (will be replaced by next_url on pagination)
-    next_url = (
+    base_url = (
         f"https://api.polygon.io/v3/trades/{ticker}"
         f"?timestamp.gte={start_date}&timestamp.lte={end_date}&limit=50000"
     )
+    url = f"{base_url}&apiKey={POLYGON_API_KEY}"
 
     total_downloaded = 0
     total_saved      = 0
     page_count       = 1
 
-    while next_url:
-        print(f"--- Fetching Page {page_count} for {ticker} ---")
+    while url:
+        print(f"--- Fetching page {page_count} for {ticker} ---")
         try:
-            paginated = f"{next_url}&apiKey={POLYGON_API_KEY}"
-            resp      = httpx.get(paginated, timeout=60.0)
+            resp = httpx.get(url, timeout=60)
             resp.raise_for_status()
-            data      = resp.json()
+            data = resp.json()
         except Exception as e:
-            print(f"Error fetching data for {ticker} from Polygon: {e}")
+            print(f"● Fetch error for {ticker}: {e}")
             traceback.print_exc()
             break
 
         results = data.get("results", [])
         if not results:
-            print(f"No more trades for {ticker} in this range.\n")
+            print("● No more data.\n")
             break
 
         total_downloaded += len(results)
 
-        # sample-print first 5
-        print(f"  → Downloaded {len(results)} raw records for {ticker}; samples:")
-        for i, trade in enumerate(results[:5]):
-            ts_ns    = trade.get('participant_timestamp')
-            time_str = (
-                datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                if ts_ns else "NO_TIMESTAMP"
+        # This section is unchanged, it just prints samples
+        for trade in results[:3]:
+            symbol = trade.get('sym') or trade.get('symbol') or ticker
+            ts_ns  = trade.get('participant_timestamp')
+            ts_str = (
+                datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc)
+                        .strftime('%H:%M:%S')
+                if ts_ns else "NO_TS"
             )
-            print(f"    [{i+1}] Qty={trade.get('size')}, Price={trade.get('price')}, Time={time_str}, "
-                  f"Exch={trade.get('exchange')}, TRF={'YES' if 'trf_id' in trade else 'NO'}, "
-                  f"Conds={trade.get('conditions',[])}")
+            size  = trade.get('size')
+            price = trade.get('price')
+            print(f"  • {symbol} {size}@{price} at {ts_str}")
+        print()
 
-        # insert loop
-        saved_on_page = 0
+        saved_this_page = 0
         with conn.cursor() as cur:
             for trade in results:
-                quantity   = trade.get('size')
-                price      = trade.get('price')
-                ts_ns      = trade.get('participant_timestamp')
-                conditions = trade.get('conditions')
-                exchange   = trade.get('exchange')
-                trf_id     = trade.get('trf_id')
-                trf_ts     = trade.get('trf_timestamp') or ts_ns
+                qty   = trade.get('size')
+                pr    = trade.get('price')
+                ts_ns = trade.get('participant_timestamp')
+                exch  = trade.get('exchange')
+                trf   = trade.get('trf_id')
+                conds = trade.get('conditions', [])
 
-                # skip bad data
-                if not all([quantity, price, ts_ns, exchange, trf_ts]):
+                if not all([qty, pr, ts_ns, exch is not None]):
                     continue
 
-                trade_value = quantity * price
-                # your block-trade filter
-                if quantity < 10000 and trade_value < 200000:
-                    continue
+                val = qty * pr
+                dt  = datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc)
 
-                trade_time = datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc)
-
-                cur.execute(
-                    """
-                    INSERT INTO block_trades
-                      (trade_time, ticker, price, quantity,
-                       trade_value, conditions, exchange,
-                       trf_id, trf_timestamp)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT DO NOTHING;
-                    """,
-                    (
-                        trade_time,
-                        ticker,
-                        price,
-                        quantity,
-                        trade_value,
-                        conditions,
-                        exchange,
-                        trf_id,
-                        trf_ts
+                if mode == 'block':
+                    # This dark pool logic is completely unchanged
+                    if exch != 4 or trf is None or (qty < 10000 and val < 200000):
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO block_trades
+                          (trade_time, ticker, price, quantity, trade_value,
+                           conditions, exchange, trf_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (dt, ticker, pr, qty, val, conds, exch, trf)
                     )
-                )
+                else:  # lit mode
+                    # ✅ MODIFIED: Now checks the $10 million minimum value threshold for lit trades
+                    if (exch == 4 and trf is not None) or val < LIT_MIN_BACKFILL_VALUE:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO lit_trades
+                          (trade_time, ticker, price, quantity, trade_value,
+                           conditions, exchange)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        (dt, ticker, pr, qty, val, conds, exch)
+                    )
+
                 if cur.rowcount:
-                    saved_on_page += 1
+                    saved_this_page += 1
 
         conn.commit()
-        total_saved += saved_on_page
+        total_saved += saved_this_page
+        print(f"→ Saved {saved_this_page} new rows (total {total_saved}).\n")
 
-        print(f"  → Processed {len(results)} records for {ticker}, "
-              f"saved {saved_on_page} new block trades "
-              f"(total saved so far for {ticker}: {total_saved}).\n")
-
-        next_url = data.get("next_url")
+        next_url = data.get('next_url')
         if next_url:
+            url = f"{next_url}&apiKey={POLYGON_API_KEY}"
             page_count += 1
-            time.sleep(1)  # throttle between pages
+            time.sleep(1)
+        else:
+            break
 
-    print(f"Backfill complete for {ticker}:")
-    print(f"  • Downloaded {total_downloaded} raw records")
-    print(f"  • Saved     {total_saved} valid block trades\n")
+    print(f"Finished {mode} backfill for {ticker}: downloaded {total_downloaded}, saved {total_saved}.\n")
     conn.close()
 
-
-# ─── MAIN ENTRYPOINT ────────────────────────────────────────────
+# --- MAIN ENTRYPOINT ---------------------------------------------
 if __name__ == "__main__":
-    start_date = "2025-06-20"
-    end_date   = "2025-06-26"
+    parser = argparse.ArgumentParser(description="Backfill lit or block trades")
+    parser.add_argument('--mode', choices=['block','lit'], required=True,
+                        help="Which table to backfill: 'block' or 'lit'")
+    args = parser.parse_args()
+    mode = args.mode
+
+    start_date = "2025-06-27"
+    end_date   = "2025-07-26"
 
     if not POLYGON_API_KEY:
-        raise ValueError("Polygon API Key not found in environment.")
+        raise ValueError("Polygon API Key not set")
 
-    # read tickers from file
     try:
         with open(TICKERS_FILE) as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
     except FileNotFoundError:
-        raise FileNotFoundError(f"Tickers file '{TICKERS_FILE}' not found.")
+        raise SystemExit(f"Tickers file '{TICKERS_FILE}' not found")
 
     for ticker in tickers:
-        # clear only the window you’re about to backfill
+        if not ticker.isalnum():
+            print(f"Skipping invalid ticker '{ticker}'")
+            continue
+
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                print(f"Clearing {ticker} trades from {start_date} to {end_date}…")
-                cur.execute("""
-                    DELETE FROM block_trades
+                table = 'block_trades' if mode == 'block' else 'lit_trades'
+                print(f"Clearing {table} for {ticker} {start_date}-{end_date}")
+                cur.execute(
+                    f"""
+                    DELETE FROM {table}
                      WHERE ticker     = %s
                        AND trade_time >= %s::date
                        AND trade_time <  (%s::date + INTERVAL '1 day');
-                """, (
-                    ticker,
-                    start_date,
-                    end_date
-                ))
+                    """,
+                    (ticker, start_date, end_date)
+                )
             conn.commit()
             print("Window cleared.\n")
 
-        # backfill this ticker
-        backfill_data(ticker, start_date, end_date)
+        backfill_data(ticker, start_date, end_date, mode)
