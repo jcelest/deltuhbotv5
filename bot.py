@@ -310,7 +310,7 @@ class LitCommands(app_commands.Group):
         headers = ['Ticker','Quantity','Price','Value','Time']
         await run_paginated_command(
             interaction, url, headers, title,
-            header_gradient=((0, 25, 255), (0, 10, 105))
+            header_gradient=((97, 138, 250), (0, 68, 255))
         )
 
     @app_commands.command(name='bigprints', description='Top 100 lit trades by value over the last X days')
@@ -322,7 +322,7 @@ class LitCommands(app_commands.Group):
         headers = ['Ticker','Quantity','Price','Value','Time']
         await run_paginated_command(
             interaction, url, headers, title,
-            header_gradient=((0, 25, 255), (0, 10, 105))
+            header_gradient=((97, 138, 250), (0, 68, 255))
         )
 
 # ─── BOT LIFECYCLE ───────────────────────────────────────────────
