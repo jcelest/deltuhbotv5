@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import traceback
-from typing import List, Optional
-
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from typing import List, Optional, Any
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -23,26 +23,26 @@ NY_TZ = ZoneInfo("America/New_York")
 # --- FASTAPI APP -------------------------------------------------
 app = FastAPI(
     title="Dark Pool & Block Trade API",
-    description="Serves block trade data from a local PostgreSQL database.",
-    version="6.0" # Final, working version
+    description="Serves live‐updated block trade data from local DB",
+    version="12.0" # Updated filter to $400M and increased page limit
 )
 
-# --- Pydantic Model ----------------------------------------------
-class Trade(BaseModel):
-    ticker: str
-    quantity: int
-    price: float
+# --- Pydantic model ----------------------------------------------
+class BlockTrade(BaseModel):
+    ticker:      str
+    quantity:    int
+    price:       float
     trade_value: float
-    trade_time: datetime
-    conditions: Optional[List[int]] = Field(default=None)
+    trade_time:  datetime
+    conditions:  Optional[List[int]] = None
 
-# --- Connection Pool ---------------------------------------------
-db_pool: Optional[pool.SimpleConnectionPool] = None
+# --- CONNECTION POOL ---------------------------------------------
+_db_pool: Optional[pool.SimpleConnectionPool] = None
 
 @app.on_event("startup")
 def startup():
-    global db_pool
-    db_pool = pool.SimpleConnectionPool(
+    global _db_pool
+    _db_pool = pool.SimpleConnectionPool(
         minconn=1, maxconn=10,
         dbname=DB_NAME, user=DB_USER, password=DB_PASS,
         host=DB_HOST, port=DB_PORT
@@ -50,22 +50,22 @@ def startup():
 
 @app.on_event("shutdown")
 def shutdown():
-    if db_pool:
-        db_pool.closeall()
+    if _db_pool:
+        _db_pool.closeall()
 
 def get_db_connection():
-    if not db_pool:
-        raise RuntimeError("Database connection pool not initialized")
-    return db_pool.getconn()
+    if not _db_pool:
+        raise RuntimeError("Connection pool not initialized")
+    return _db_pool.getconn()
 
 def release_db_connection(conn):
-    if db_pool and conn:
-        db_pool.putconn(conn)
+    if _db_pool and conn:
+        _db_pool.putconn(conn)
 
-# --- Reusable Helper for Dynamic Threshold -------------------------
+# --- DYNAMIC FLOOR HELPER ----------------------------------------
 def get_dynamic_threshold(ticker: str, percentile: float, table_name: str) -> float:
     if table_name not in ('block_trades', 'lit_trades'):
-        raise ValueError("Invalid table name provided for threshold calculation")
+        raise ValueError("Invalid table name")
     conn = get_db_connection()
     try:
         sql = f"""
@@ -81,7 +81,7 @@ def get_dynamic_threshold(ticker: str, percentile: float, table_name: str) -> fl
             cur.execute(sql, (ticker.upper(), percentile))
             row = cur.fetchone()
             if row and row[0] is not None:
-                return float(row[0])
+                return row[0]
     except Exception:
         traceback.print_exc()
     finally:
@@ -89,16 +89,16 @@ def get_dynamic_threshold(ticker: str, percentile: float, table_name: str) -> fl
     return DEFAULT_MIN_VALUE
 
 # --- API Endpoints --------------------------------------------------
-@app.get("/dp/allblocks/{ticker}", response_model=List[Trade], summary="Block trades outside market hours")
+@app.get("/dp/allblocks/{ticker}", response_model=List[BlockTrade], summary="Block trades outside NYSE hours")
 def get_all_blocks(ticker: str, percentile: float = Query(0.98, ge=0, le=1)):
     floor = get_dynamic_threshold(ticker, percentile, 'block_trades')
-    conn = get_db_connection()
+    conn  = get_db_connection()
     try:
-        # This query is correct and will display NY time
         sql = """
-            SELECT ticker, quantity, price::float, trade_value::float, 
-                   (trade_time AT TIME ZONE 'America/New_York') as trade_time, 
-                   conditions
+            SELECT
+              ticker, quantity, price::float, trade_value::float,
+              (trade_time AT TIME ZONE 'America/New_York') AS trade_time,
+              conditions
             FROM block_trades
             WHERE ticker = %s AND trade_value >= %s
               AND (trade_time AT TIME ZONE 'America/New_York')::time NOT BETWEEN '09:30:00' AND '16:00:00'
@@ -110,16 +110,16 @@ def get_all_blocks(ticker: str, percentile: float = Query(0.98, ge=0, le=1)):
     finally:
         release_db_connection(conn)
 
-@app.get("/dp/alldp/{ticker}", response_model=List[Trade], summary="Block trades during market hours")
+@app.get("/dp/alldp/{ticker}", response_model=List[BlockTrade], summary="Block trades during market hours")
 def get_all_dark_pool(ticker: str, percentile: float = Query(0.98, ge=0, le=1)):
     floor = get_dynamic_threshold(ticker, percentile, 'block_trades')
-    conn = get_db_connection()
+    conn  = get_db_connection()
     try:
-        # This query is correct and will display NY time
         sql = """
-            SELECT ticker, quantity, price::float, trade_value::float, 
-                   (trade_time AT TIME ZONE 'America/New_York') as trade_time, 
-                   conditions
+            SELECT
+              ticker, quantity, price::float, trade_value::float,
+              (trade_time AT TIME ZONE 'America/New_York') AS trade_time,
+              conditions
             FROM block_trades
             WHERE ticker = %s AND trade_value >= %s
               AND (trade_time AT TIME ZONE 'America/New_York')::time BETWEEN '09:30:00' AND '16:00:00'
@@ -131,26 +131,31 @@ def get_all_dark_pool(ticker: str, percentile: float = Query(0.98, ge=0, le=1)):
     finally:
         release_db_connection(conn)
 
-def big_prints_query(table_name: str, days: int):
-    # Calculate timezone-aware start/end times in Python
+def big_prints_query(table_name: str, days: int, under_400m: bool = False):
     now_ny = datetime.now(NY_TZ)
     end_of_today_ny = now_ny.replace(hour=23, minute=59, second=59, microsecond=999999)
     start_date_ny = (now_ny - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Convert to UTC for the database query, as all our data is stored in UTC
     start_utc = start_date_ny.astimezone(timezone.utc)
     end_utc = end_of_today_ny.astimezone(timezone.utc)
 
+    additional_filter = ""
+    if under_400m:
+        # ✅ MODIFIED: Value is now 400,000,000
+        additional_filter = "AND trade_value < 400000000"
+
     conn = get_db_connection()
     try:
-        # Use a simple BETWEEN on the indexed trade_time column. This is fast.
+        # ✅ MODIFIED: Increased LIMIT to 300 to provide up to 20 pages
         sql = f"""
-            SELECT ticker, quantity, price::float, trade_value::float, 
-                   (trade_time AT TIME ZONE 'America/New_York') as trade_time, 
-                   conditions
+            SELECT
+              ticker, quantity, price::float, trade_value::float,
+              (trade_time AT TIME ZONE 'America/New_York') as trade_time,
+              conditions
             FROM {table_name}
             WHERE trade_time BETWEEN %s AND %s
-            ORDER BY trade_value DESC LIMIT 100;
+            {additional_filter}
+            ORDER BY trade_value DESC LIMIT 300;
         """
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (start_utc, end_utc))
@@ -161,23 +166,22 @@ def big_prints_query(table_name: str, days: int):
     finally:
         release_db_connection(conn)
 
-@app.get("/dp/bigprints", response_model=List[Trade], summary="Top 100 dark pool prints by value")
+@app.get("/dp/bigprints", response_model=List[BlockTrade], summary="Top block trades by value over the last X days")
 def get_dp_big_prints(days: int = Query(1, ge=1, le=30)):
     return big_prints_query('block_trades', days)
 
-@app.get("/lit/all/{ticker}", response_model=List[Trade], summary="All lit-market trades for a ticker")
+@app.get("/lit/all/{ticker}", response_model=List[BlockTrade], summary="All lit-market trades for a ticker")
 def get_all_lit(ticker: str, percentile: Optional[float] = Query(None, ge=0, le=1)):
     floor = DEFAULT_MIN_VALUE
     if percentile is not None:
         floor = get_dynamic_threshold(ticker, percentile, 'lit_trades')
-    
     conn = get_db_connection()
     try:
-        # This query is correct and will display NY time
         sql = """
-            SELECT ticker, quantity, price::float, trade_value::float, 
-                   (trade_time AT TIME ZONE 'America/New_York') as trade_time, 
-                   conditions
+            SELECT
+              ticker, quantity, price::float, trade_value::float,
+              (trade_time AT TIME ZONE 'America/New_York') AS trade_time,
+              conditions
             FROM lit_trades
             WHERE ticker = %s AND trade_value >= %s
             ORDER BY trade_time DESC LIMIT 500;
@@ -188,6 +192,6 @@ def get_all_lit(ticker: str, percentile: Optional[float] = Query(None, ge=0, le=
     finally:
         release_db_connection(conn)
 
-@app.get("/lit/bigprints", response_model=List[Trade], summary="Top 100 lit prints by value")
-def get_lit_big_prints(days: int = Query(1, ge=1, le=30)):
-    return big_prints_query('lit_trades', days)
+@app.get("/lit/bigprints", response_model=List[BlockTrade], summary="Top lit trades by value over the last X days")
+def get_lit_big_prints(days: int = Query(1, ge=1, le=30), under_400m: bool = False):
+    return big_prints_query('lit_trades', days, under_400m)
