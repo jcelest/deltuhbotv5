@@ -24,7 +24,7 @@ NY_TZ = ZoneInfo("America/New_York")
 app = FastAPI(
     title="Dark Pool & Block Trade API",
     description="Serves live‐updated block trade data from local DB",
-    version="12.0" # Updated filter to $400M and increased page limit
+    version="14.0" # Simplified for bot-side summary processing
 )
 
 # --- Pydantic model ----------------------------------------------
@@ -82,8 +82,6 @@ def get_dynamic_threshold(ticker: str, percentile: float, table_name: str) -> fl
             row = cur.fetchone()
             if row and row[0] is not None:
                 return row[0]
-    except Exception:
-        traceback.print_exc()
     finally:
         release_db_connection(conn)
     return DEFAULT_MIN_VALUE
@@ -135,38 +133,27 @@ def big_prints_query(table_name: str, days: int, under_400m: bool = False):
     now_ny = datetime.now(NY_TZ)
     end_of_today_ny = now_ny.replace(hour=23, minute=59, second=59, microsecond=999999)
     start_date_ny = (now_ny - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-
     start_utc = start_date_ny.astimezone(timezone.utc)
     end_utc = end_of_today_ny.astimezone(timezone.utc)
-
-    additional_filter = ""
-    if under_400m:
-        # ✅ MODIFIED: Value is now 400,000,000
-        additional_filter = "AND trade_value < 400000000"
-
+    additional_filter = "AND trade_value < 400000000" if under_400m else ""
     conn = get_db_connection()
     try:
-        # ✅ MODIFIED: Increased LIMIT to 300 to provide up to 20 pages
         sql = f"""
             SELECT
               ticker, quantity, price::float, trade_value::float,
               (trade_time AT TIME ZONE 'America/New_York') as trade_time,
               conditions
             FROM {table_name}
-            WHERE trade_time BETWEEN %s AND %s
-            {additional_filter}
+            WHERE trade_time BETWEEN %s AND %s {additional_filter}
             ORDER BY trade_value DESC LIMIT 300;
         """
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (start_utc, end_utc))
             return cur.fetchall()
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"DB error in {table_name} bigprints")
     finally:
         release_db_connection(conn)
 
-@app.get("/dp/bigprints", response_model=List[BlockTrade], summary="Top block trades by value over the last X days")
+@app.get("/dp/bigprints", response_model=List[BlockTrade], summary="Top block trades by value")
 def get_dp_big_prints(days: int = Query(1, ge=1, le=30)):
     return big_prints_query('block_trades', days)
 
@@ -192,6 +179,6 @@ def get_all_lit(ticker: str, percentile: Optional[float] = Query(None, ge=0, le=
     finally:
         release_db_connection(conn)
 
-@app.get("/lit/bigprints", response_model=List[BlockTrade], summary="Top lit trades by value over the last X days")
+@app.get("/lit/bigprints", response_model=List[BlockTrade], summary="Top lit trades by value")
 def get_lit_big_prints(days: int = Query(1, ge=1, le=30), under_400m: bool = False):
     return big_prints_query('lit_trades', days, under_400m)

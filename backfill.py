@@ -15,7 +15,6 @@ DB_HOST         = "localhost"
 DB_PORT         = "5432"
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY')
 TICKERS_FILE    = "tickers.txt"
-# ✅ NEW: Minimum value for backfilling lit trades set to $10 million
 LIT_MIN_BACKFILL_VALUE = 10_000_000 
 
 # --- DB CONNECT --------------------------------------------------
@@ -61,13 +60,11 @@ def backfill_data(ticker: str, start_date: str, end_date: str, mode: str):
 
         total_downloaded += len(results)
 
-        # This section is unchanged, it just prints samples
         for trade in results[:3]:
             symbol = trade.get('sym') or trade.get('symbol') or ticker
             ts_ns  = trade.get('participant_timestamp')
             ts_str = (
-                datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc)
-                        .strftime('%H:%M:%S')
+                datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc).strftime('%H:%M:%S')
                 if ts_ns else "NO_TS"
             )
             size  = trade.get('size')
@@ -84,6 +81,8 @@ def backfill_data(ticker: str, start_date: str, end_date: str, mode: str):
                 exch  = trade.get('exchange')
                 trf   = trade.get('trf_id')
                 conds = trade.get('conditions', [])
+                # ✅ FIX: Get the TRF timestamp from the API response
+                trf_ts = trade.get('trf_timestamp')
 
                 if not all([qty, pr, ts_ns, exch is not None]):
                     continue
@@ -92,21 +91,20 @@ def backfill_data(ticker: str, start_date: str, end_date: str, mode: str):
                 dt  = datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc)
 
                 if mode == 'block':
-                    # This dark pool logic is completely unchanged
                     if exch != 4 or trf is None or (qty < 10000 and val < 200000):
                         continue
+                    # ✅ FIX: Add the trf_timestamp column and its value to the INSERT statement
                     cur.execute(
                         """
                         INSERT INTO block_trades
                           (trade_time, ticker, price, quantity, trade_value,
-                           conditions, exchange, trf_id)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                           conditions, exchange, trf_id, trf_timestamp)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         ON CONFLICT DO NOTHING;
                         """,
-                        (dt, ticker, pr, qty, val, conds, exch, trf)
+                        (dt, ticker, pr, qty, val, conds, exch, trf, trf_ts)
                     )
                 else:  # lit mode
-                    # ✅ MODIFIED: Now checks the $10 million minimum value threshold for lit trades
                     if (exch == 4 and trf is not None) or val < LIT_MIN_BACKFILL_VALUE:
                         continue
                     cur.execute(
@@ -146,8 +144,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     mode = args.mode
 
-    start_date = "2025-06-27"
-    end_date   = "2025-07-26"
+    # Note: You may want to make these command-line arguments as well
+    start_date = "2025-02-01"
+    end_date   = "2025-08-15"
 
     if not POLYGON_API_KEY:
         raise ValueError("Polygon API Key not set")
