@@ -145,8 +145,8 @@ if __name__ == "__main__":
     mode = args.mode
 
     # Note: You may want to make these command-line arguments as well
-    start_date = "2025-02-01"
-    end_date   = "2025-08-15"
+    start_date = "2025-08-24"
+    end_date   = "2025-08-25"
 
     if not POLYGON_API_KEY:
         raise ValueError("Polygon API Key not set")
