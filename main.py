@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 UNIFIED API - Both lit/dp and SD functionality in one server
-OPTIMIZED VERSION - Uses backfill.py patterns for 10-20x faster volume jobs
+ENHANCED VERSION - Unlimited API calls, job segments, correct date handling
+INCLUDES: Segmented absorption timeline visualization with supply/demand colors
 """
 
 import os
@@ -55,7 +56,7 @@ NY_TZ = ZoneInfo("America/New_York")
 # Connection pools - SEPARATE for each database
 darkpool_db_pool: Optional[psycopg2.pool.SimpleConnectionPool] = None
 sd_db_pool: Optional[asyncpg.Pool] = None
-sd_sync_pool: Optional[psycopg2.pool.SimpleConnectionPool] = None  # NEW: For fast batch operations
+sd_sync_pool: Optional[psycopg2.pool.SimpleConnectionPool] = None
 jobs_db: Dict[str, Dict] = {}  # In-memory job tracking
 
 # ─── HELPER FUNCTIONS ────────────────────────────────────────────
@@ -93,7 +94,7 @@ class MarketVolumeResponse(BaseModel):
     total_trades: int
     price_range: str
     data_source: str
-    processing_method: Optional[str] = "optimized"
+    processing_method: Optional[str] = "enhanced"
     api_calls_made: Optional[int] = 0
 
 class JobStatus(BaseModel):
@@ -103,26 +104,39 @@ class JobStatus(BaseModel):
     result: Optional[Dict] = None
     error: Optional[str] = None
 
-# ─── JOB PERSISTENCE FUNCTIONS ──────────────────────────────────
+class JobSegment(BaseModel):
+    job_id: str
+    level_id: int
+    volume: int
+    value: float
+    trades: int
+    date_start: str
+    date_end: str
+    created_at: datetime
+
+# ─── ENHANCED JOB PERSISTENCE FUNCTIONS ──────────────────────────
 
 async def save_job_to_db(job_id: str, job_data: Dict):
-    """Save job to database with proper JSON serialization"""
+    """Save job to database with enhanced tracking"""
     if sd_db_pool is None:
         return
         
     async with sd_db_pool.acquire() as conn:
-        # Convert result to JSON string if it exists, otherwise None
+        # Convert result to JSON string if it exists
         result_json = None
         if job_data.get('result'):
             result_json = json.dumps(job_data.get('result'))
         
+        # Enhanced job saving with new fields
         await conn.execute(
             """
             INSERT INTO background_jobs 
-            (job_id, ticker, level_price, level_id, date_range, status, progress, created_at, result_data)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (job_id, ticker, level_price, level_id, date_range, status, progress, 
+             created_at, result_data, enhancement, api_calls_used, is_absorption)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (job_id) DO UPDATE SET
-            status = $6, progress = $7, result_data = $9, 
+            status = $6, progress = $7, result_data = $9, enhancement = $10,
+            api_calls_used = $11, is_absorption = $12,
             completed_at = CASE WHEN $6 = 'completed' THEN NOW() ELSE background_jobs.completed_at END
             """,
             job_id,
@@ -133,11 +147,14 @@ async def save_job_to_db(job_id: str, job_data: Dict):
             job_data.get('status'),
             job_data.get('progress', 0),
             datetime.fromisoformat(job_data.get('created_at', datetime.now().isoformat())),
-            result_json
+            result_json,
+            job_data.get('enhancement', 'standard'),
+            job_data.get('api_calls_used', 0),
+            job_data.get('is_absorption', False)
         )
 
 async def load_jobs_from_db():
-    """Load existing jobs from database into memory with JSON parsing"""
+    """Load existing jobs from database into memory"""
     if sd_db_pool is None:
         return
         
@@ -154,6 +171,9 @@ async def load_jobs_from_db():
                 'status': row['status'],
                 'progress': row['progress'],
                 'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                'enhancement': row.get('enhancement', 'standard'),
+                'api_calls_used': row.get('api_calls_used', 0),
+                'is_absorption': row.get('is_absorption', False)
             }
             
             # Parse result_data JSON if it exists
@@ -195,7 +215,7 @@ async def init_darkpool_db_pool():
         raise
 
 async def init_sd_db_pool():
-    """Initialize SD database connection pool (asyncpg)"""
+    """Initialize enhanced SD database connection pool"""
     global sd_db_pool
     try:
         sd_db_pool = await asyncpg.create_pool(
@@ -204,49 +224,31 @@ async def init_sd_db_pool():
             user=SD_DB_USER,
             password=SD_DB_PASS,
             database=SD_DB_NAME,
-            min_size=3,
-            max_size=15
+            min_size=5,
+            max_size=25  # Increased for enhanced functionality
         )
-        logger.info(f"SD DB pool initialized: {SD_DB_NAME}")
-        
-        # Create jobs table if it doesn't exist
-        async with sd_db_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS background_jobs (
-                    job_id VARCHAR(255) PRIMARY KEY,
-                    ticker VARCHAR(10),
-                    level_price DECIMAL(10,2),
-                    level_id INTEGER,
-                    date_range VARCHAR(50),
-                    status VARCHAR(50),
-                    progress INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    completed_at TIMESTAMP,
-                    result_data JSONB,
-                    error_message TEXT
-                )
-            """)
+        logger.info(f"Enhanced SD DB pool initialized: {SD_DB_NAME}")
         
         # Load existing jobs into memory
         await load_jobs_from_db()
         
     except Exception as e:
-        logger.error(f"Failed to initialize SD DB pool: {e}")
+        logger.error(f"Failed to initialize enhanced SD DB pool: {e}")
         raise
 
 async def init_sd_sync_pool():
-    """Initialize SD sync pool for fast batch operations"""
+    """Initialize SD sync pool for batch operations"""
     global sd_sync_pool
     try:
         sd_sync_pool = psycopg2.pool.SimpleConnectionPool(
-            minconn=2, maxconn=8,
+            minconn=3, maxconn=12,  # Increased for better performance
             dbname=SD_DB_NAME,
             user=SD_DB_USER,
             password=SD_DB_PASS,
             host=SD_DB_HOST,
             port=SD_DB_PORT
         )
-        logger.info(f"SD sync pool initialized for batch operations")
+        logger.info(f"Enhanced SD sync pool initialized for batch operations")
     except Exception as e:
         logger.error(f"Failed to initialize SD sync pool: {e}")
         raise
@@ -261,7 +263,7 @@ async def close_db_pools():
     
     if sd_db_pool:
         await sd_db_pool.close()
-        logger.info("SD DB pool closed")
+        logger.info("Enhanced SD DB pool closed")
     
     if sd_sync_pool:
         sd_sync_pool.closeall()
@@ -292,13 +294,13 @@ def release_sd_sync_connection(conn):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("🚀 Unified FastAPI server starting up...")
+    logger.info("🚀 Enhanced Unified FastAPI server starting up...")
     await init_darkpool_db_pool()
     await init_sd_db_pool()
     await init_sd_sync_pool()
     yield
     # Shutdown
-    logger.info("🔄 Unified FastAPI server shutting down...")
+    logger.info("🔄 Enhanced Unified FastAPI server shutting down...")
     await close_db_pools()
 
 # ─── ORIGINAL DARKPOOL FUNCTIONS (UNCHANGED) ─────────────────────
@@ -360,20 +362,18 @@ def big_prints_query(table_name: str, days: int, under_400m: bool = False, marke
     finally:
         release_darkpool_connection(conn)
 
-# ─── OPTIMIZED SD DATABASE FUNCTIONS ─────────────────────────────
+# ─── ENHANCED SD DATABASE FUNCTIONS ─────────────────────────────
 
-async def fast_calculate_level_volume(ticker: str, level_price: float, 
-                                    start_date: str, end_date: str, 
-                                    tolerance: float = 0.025) -> Dict:
+async def unlimited_fast_calculate_level_volume(ticker: str, level_price: float, 
+                                              start_date: str, end_date: str, 
+                                              tolerance: float = 0.025) -> Dict:
     """
-    OPTIMIZED: Fast level volume calculation using direct API processing
-    No database storage - calculate volume in memory during API pagination
-    Based on backfill.py efficiency patterns
+    ENHANCED: Unlimited API calls for maximum data coverage
     """
     if not POLYGON_API_KEY:
         raise ValueError("POLYGON_API_KEY not set")
     
-    # Convert dates to timestamps (like backfill.py)
+    # Convert dates to timestamps
     start_dt = datetime.strptime(start_date, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
     
@@ -383,7 +383,7 @@ async def fast_calculate_level_volume(ticker: str, level_price: float,
     min_price = level_price - tolerance
     max_price = level_price + tolerance
     
-    # Build URL (same as backfill.py)
+    # Build URL
     base_url = (
         f"https://api.polygon.io/v3/trades/{ticker.upper()}"
         f"?timestamp.gte={start_timestamp}&timestamp.lte={end_timestamp}&limit=50000"
@@ -398,26 +398,29 @@ async def fast_calculate_level_volume(ticker: str, level_price: float,
     min_actual_price = float('inf')
     max_actual_price = 0.0
     
-    logger.info(f"🚀 Fast calculation for {ticker} at ${level_price:.2f} ±${tolerance:.3f}")
+    logger.info(f"🚀 UNLIMITED calculation for {ticker} at ${level_price:.2f} ±${tolerance:.3f}")
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=200.0) as client:  # Extended timeout
         while url:
             api_calls += 1
-            logger.info(f"⚡ API call {api_calls} for {ticker}")
+            logger.info(f"⚡ UNLIMITED API call {api_calls} for {ticker}")
             
             try:
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
-                logger.error(f"API error: {e}")
-                break
+                logger.error(f"API error on call {api_calls}: {e}")
+                # Continue with partial data instead of breaking
+                await asyncio.sleep(1.0)
+                continue
             
             results = data.get("results", [])
             if not results:
+                logger.info(f"No more results after {api_calls} calls")
                 break
             
-            # Process trades in memory (like backfill.py filtering)
+            # Process trades in memory
             for trade in results:
                 qty = trade.get('size')
                 price = trade.get('price')
@@ -425,7 +428,7 @@ async def fast_calculate_level_volume(ticker: str, level_price: float,
                 if not (qty and price):
                     continue
                 
-                # Apply price filter immediately (no database storage)
+                # Apply price filter immediately
                 if min_price <= price <= max_price:
                     total_volume += qty
                     total_value += (qty * price)
@@ -439,14 +442,14 @@ async def fast_calculate_level_volume(ticker: str, level_price: float,
             next_url = data.get('next_url')
             if next_url:
                 url = f"{next_url}&apiKey={POLYGON_API_KEY}"
-                await asyncio.sleep(0.1)  # Rate limiting
+                await asyncio.sleep(0.03)  # Reduced delay for faster processing
             else:
+                logger.info(f"Reached end of data after {api_calls} calls")
                 break
             
-            # Safety break for large datasets
-            if api_calls >= 200:
-                logger.warning(f"Reached 200 API calls limit")
-                break
+            # Progress logging every 100 calls
+            if api_calls % 100 == 0:
+                logger.info(f"📊 UNLIMITED Progress: {api_calls} calls, {total_trades:,} trades found")
     
     # Format price range
     if total_trades > 0 and min_actual_price != float('inf'):
@@ -454,7 +457,7 @@ async def fast_calculate_level_volume(ticker: str, level_price: float,
     else:
         price_range = f"${level_price:.2f} (no trades found)"
     
-    logger.info(f"✅ Fast calculation complete: {total_trades:,} trades, {total_volume:,} volume, {api_calls} API calls")
+    logger.info(f"✅ UNLIMITED calculation complete: {total_trades:,} trades, {total_volume:,} volume, {api_calls} API calls")
     
     return {
         'total_volume': total_volume,
@@ -462,9 +465,133 @@ async def fast_calculate_level_volume(ticker: str, level_price: float,
         'total_trades': total_trades,
         'price_range': price_range,
         'api_calls_made': api_calls,
-        'data_source': 'direct_api_calculation',
-        'processing_method': 'fast_memory_only'
+        'data_source': 'unlimited_direct_api_calculation',
+        'processing_method': 'unlimited_fast_memory_only'
     }
+
+async def create_absorption_job_segment(level_id: int, job_id: str, volume_data: Dict, 
+                                       start_date: str, end_date: str) -> None:
+    """Create a new absorption job segment for timeline tracking"""
+    if sd_db_pool is None:
+        raise RuntimeError("SD database pool not initialized")
+    
+    async with sd_db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO absorption_job_segments 
+            (job_id, level_id, volume, value, trades, date_start, date_end, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            """,
+            job_id, level_id, volume_data['total_volume'], volume_data['total_value'],
+            volume_data['total_trades'], parse_date_string(start_date), 
+            parse_date_string(end_date)
+        )
+
+async def get_absorption_segments_for_level(level_id: int) -> List[Dict]:
+    """Get all absorption job segments for a specific level"""
+    if sd_db_pool is None:
+        raise RuntimeError("SD database pool not initialized")
+    
+    async with sd_db_pool.acquire() as conn:
+        segments = await conn.fetch(
+            """
+            SELECT job_id, volume, value, trades, date_start, date_end, created_at
+            FROM absorption_job_segments 
+            WHERE level_id = $1 
+            ORDER BY date_start ASC
+            """,
+            level_id
+        )
+        
+        return [
+            {
+                'job_id': seg['job_id'],
+                'volume': seg['volume'],
+                'value': float(seg['value']),
+                'trades': seg['trades'],
+                'date_start': seg['date_start'].isoformat(),
+                'date_end': seg['date_end'].isoformat(),
+                'created_at': seg['created_at'].isoformat()
+            }
+            for seg in segments
+        ]
+
+async def get_enhanced_sd_levels_for_timeline(ticker: str) -> List[Dict]:
+    """Get SD levels with enhanced data including job segments"""
+    if sd_db_pool is None:
+        raise RuntimeError("SD database pool not initialized")
+    
+    async with sd_db_pool.acquire() as conn:
+        levels = await conn.fetch(
+            """
+            SELECT l.id, l.ticker, l.level_price, l.level_type, l.level_name, 
+                   l.date_created, l.is_active,
+                   v.original_volume, v.absorbed_volume, v.absorption_percentage,
+                   v.original_value, v.absorbed_value, v.last_updated,
+                   v.original_date_start, v.original_date_end, v.absorption_start_date
+            FROM supply_demand_levels l
+            LEFT JOIN level_volume_tracking v ON l.id = v.level_id
+            WHERE l.ticker = $1 AND l.is_active = true
+            ORDER BY l.level_price DESC
+            """,
+            ticker.upper()
+        )
+        
+        enhanced_levels = []
+        for level in levels:
+            original_vol = level['original_volume'] or 0
+            absorbed_vol = level['absorbed_volume'] or 0
+            absorption_pct = float(level['absorption_percentage'] or 0)
+            
+            # Enhanced status calculation
+            if original_vol > 0 and absorbed_vol > 0:
+                status = "Active with Absorption Data"
+            elif original_vol > 0:
+                status = "Ready for Absorption Analysis"
+            else:
+                status = "Needs Volume Data"
+            
+            # Get job segments for this level
+            job_segments = await get_absorption_segments_for_level(level['id'])
+            
+            # FIXED: Use end date for absorption display (correct semantic)
+            last_absorption_date = None
+            if level['original_date_end']:
+                last_absorption_date = level['original_date_end'].isoformat()
+            elif job_segments:
+                # Use the latest segment end date
+                last_absorption_date = max(seg['date_end'] for seg in job_segments)
+            
+            level_data = {
+                'level': {
+                    'id': level['id'],
+                    'ticker': level['ticker'],
+                    'level_price': float(level['level_price']),
+                    'level_type': level['level_type'],
+                    'level_name': level['level_name'],
+                    'date_created': level['date_created'].isoformat() if level['date_created'] else None,
+                    'is_active': level['is_active'],
+                    'status': status
+                },
+                'volume': {
+                    'original_volume': original_vol,
+                    'absorbed_volume': absorbed_vol,
+                    'original_value': float(level['original_value'] or 0),
+                    'absorbed_value': float(level['absorbed_value'] or 0),
+                    'absorption_percentage': absorption_pct,
+                    'last_updated': level['last_updated'].isoformat() if level['last_updated'] else None
+                },
+                'dates': {
+                    'original_start': level['original_date_start'].isoformat() if level['original_date_start'] else None,
+                    'original_end': level['original_date_end'].isoformat() if level['original_date_end'] else None,
+                    'last_absorption_date': last_absorption_date  # FIXED: Shows correct end date
+                },
+                'job_segments': job_segments
+            }
+            
+            enhanced_levels.append(level_data)
+        
+        return enhanced_levels
 
 async def check_data_availability(ticker: str, start_date: str, end_date: str) -> Dict:
     """Check if we have data for this ticker/date range in SD database"""
@@ -506,24 +633,6 @@ async def check_data_availability(ticker: str, start_date: str, end_date: str) -
                 'api_calls_used': session['total_api_calls'],
                 'fetched_at': session['completed_at'].isoformat(),
                 'status': 'available'
-            }
-        
-        # Check for in-progress session
-        in_progress = await conn.fetchrow(
-            """
-            SELECT id, status, started_at FROM fetch_sessions 
-            WHERE ticker = $1 AND start_date = $2 AND end_date = $3 
-            AND status = 'processing'
-            """,
-            ticker.upper(), start_date_obj, end_date_obj
-        )
-        
-        if in_progress:
-            return {
-                'has_data': False,
-                'status': 'fetching_in_progress',
-                'session_id': in_progress['id'],
-                'started_at': in_progress['started_at'].isoformat()
             }
         
         return {
@@ -642,6 +751,75 @@ async def get_sd_levels(ticker: str) -> List[Dict]:
         
         return result
 
+async def delete_sd_level(level_id: int) -> Dict:
+    """Delete SD level and all associated data from SD database"""
+    if sd_db_pool is None:
+        raise RuntimeError("SD database pool not initialized")
+    
+    async with sd_db_pool.acquire() as conn:
+        # Check if level exists and get info
+        level_info = await conn.fetchrow(
+            "SELECT ticker, level_price, level_type, level_name FROM supply_demand_levels WHERE id = $1",
+            level_id
+        )
+        
+        if not level_info:
+            raise ValueError(f"Level {level_id} not found")
+        
+        # Delete absorption segments first
+        deleted_segments = await conn.execute(
+            "DELETE FROM absorption_job_segments WHERE level_id = $1",
+            level_id
+        )
+        
+        # Delete from level_volume_tracking
+        deleted_tracking = await conn.execute(
+            "DELETE FROM level_volume_tracking WHERE level_id = $1",
+            level_id
+        )
+        
+        # Delete the level itself
+        deleted_level = await conn.execute(
+            "DELETE FROM supply_demand_levels WHERE id = $1",
+            level_id
+        )
+        
+        return {
+            'level_id': level_id,
+            'ticker': level_info['ticker'],
+            'level_price': float(level_info['level_price']),
+            'level_type': level_info['level_type'],
+            'level_name': level_info['level_name'],
+            'deleted_tracking_records': deleted_tracking.split()[1] if deleted_tracking else "0",
+            'deleted_segments': deleted_segments.split()[1] if deleted_segments else "0",
+            'deleted': True
+        }
+
+async def delete_job_and_data(job_id: str) -> Dict:
+    """Delete background job and associated data"""
+    if job_id not in jobs_db:
+        raise ValueError(f"Job {job_id} not found")
+    
+    job_info = jobs_db[job_id].copy()
+    
+    # Remove from memory
+    del jobs_db[job_id]
+    
+    # Remove from database
+    if sd_db_pool is not None:
+        async with sd_db_pool.acquire() as conn:
+            deleted = await conn.execute(
+                "DELETE FROM background_jobs WHERE job_id = $1",
+                job_id
+            )
+    
+    return {
+        'job_id': job_id,
+        'ticker': job_info.get('ticker'),
+        'status_before_deletion': job_info.get('status'),
+        'deleted': True
+    }
+
 async def find_level_by_ticker_and_price(ticker: str, level_price: float, tolerance: float = 0.05) -> Optional[int]:
     """Find existing level by ticker and price (with tolerance)"""
     if sd_db_pool is None:
@@ -691,7 +869,7 @@ async def update_level_volume_tracking(level_id: int, ticker: str, level_price: 
                 else:
                     absorption_percentage = 0.0
                 
-                # Update absorption data
+                # FIXED: Update absorption_start_date to be the END date
                 await conn.execute(
                     """
                     UPDATE level_volume_tracking 
@@ -700,7 +878,7 @@ async def update_level_volume_tracking(level_id: int, ticker: str, level_price: 
                         last_updated = NOW()
                     WHERE level_id = $5
                     """,
-                    absorbed_volume, absorbed_value, absorption_percentage, start_date_obj, level_id
+                    absorbed_volume, absorbed_value, absorption_percentage, end_date_obj, level_id
                 )
             else:
                 raise ValueError(f"Level {level_id} has no original volume data. Set original volume first.")
@@ -715,339 +893,160 @@ async def update_level_volume_tracking(level_id: int, ticker: str, level_price: 
                  absorption_start_date, last_updated)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
                 ON CONFLICT (level_id) DO UPDATE SET
-                original_volume = $6, original_value = $7, last_updated = NOW()
+                original_volume = $6, original_value = $7, 
+                original_date_start = $11, original_date_end = $12,
+                last_updated = NOW()
                 """,
                 level_id, ticker.upper(), level_price,
                 level_price - tolerance, level_price + tolerance,
                 volume_data['total_volume'], volume_data['total_value'],
                 0, 0.0, 0.0,  # Keep existing absorption data
-                start_date_obj, end_date_obj, start_date_obj
+                start_date_obj, end_date_obj, end_date_obj  # Use end_date for absorption_start_date
             )
 
-async def batch_save_filtered_trades(trades: List[Dict], ticker: str, start_date: str, 
-                                   end_date: str, session_id: str,
-                                   level_price: float, tolerance: float) -> int:
-    """
-    OPTIMIZED: Batch save using psycopg2 (like backfill.py) but only save trades near the level
-    This reduces database load by 90%+ for most levels
-    """
-    min_price = level_price - tolerance
-    max_price = level_price + tolerance
-    
-    # Convert dates
-    start_date_obj = parse_date_string(start_date)
-    end_date_obj = parse_date_string(end_date)
-    
-    # Filter trades in memory first (like backfill.py)
-    filtered_trades = []
-    for trade in trades:
-        price = trade.get('price')
-        if price and min_price <= price <= max_price:
-            qty = trade.get('size')
-            ts_ns = trade.get('participant_timestamp')
-            if qty and ts_ns:
-                filtered_trades.append(trade)
-    
-    if not filtered_trades:
-        return 0
-    
-    # Use sync connection for batch insert (like backfill.py)
-    conn = get_sd_sync_connection()
+# ─── ENHANCED BACKGROUND JOB PROCESSING ─────────────────────────
+
+async def enhanced_absorption_job(job_id: str, ticker: str, level_price: float,
+                                start_date: str, end_date: str, tolerance: float,
+                                level_id: int):
+    """Enhanced absorption job with segments and unlimited API calls"""
     try:
-        # Prepare batch data
-        batch_data = []
-        for trade in filtered_trades:
-            qty = trade.get('size')
-            price = trade.get('price')
-            ts_ns = trade.get('participant_timestamp')
-            exch = trade.get('exchange')
-            conds = trade.get('conditions', [])
-            
-            if qty and price and ts_ns:
-                trade_value = qty * price
-                trade_time = datetime.fromtimestamp(ts_ns/1e9, tz=timezone.utc)
-                
-                batch_data.append((
-                    ticker.upper(), trade_time, price, qty, trade_value, conds,
-                    exch, ts_ns, start_date_obj, end_date_obj, session_id
-                ))
-        
-        # Batch insert using psycopg2 (like backfill.py)
-        saved_count = 0
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_batch(
-                cur,
-                """
-                INSERT INTO market_data_cache
-                  (ticker, trade_time, price, quantity, trade_value, conditions, 
-                   exchange, participant_timestamp, date_range_start, date_range_end, 
-                   fetch_session_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                batch_data,
-                page_size=1000
-            )
-            saved_count = len(batch_data)
-        
-        conn.commit()
-        return saved_count
-        
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Batch save error: {e}")
-        return 0
-    finally:
-        release_sd_sync_connection(conn)
-
-async def create_fetch_session(ticker: str, start_date: str, end_date: str) -> str:
-    """Create a new fetch session in SD database"""
-    if sd_db_pool is None:
-        raise RuntimeError("SD database pool not initialized")
-    
-    # Convert string dates to date objects
-    start_date_obj = parse_date_string(start_date)
-    end_date_obj = parse_date_string(end_date)
-    
-    session_id = str(uuid.uuid4())
-    
-    async with sd_db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO fetch_sessions (id, ticker, start_date, end_date, status)
-            VALUES ($1, $2, $3, $4, 'processing')
-            ON CONFLICT (ticker, start_date, end_date) DO UPDATE SET
-            id = $1, status = 'processing', started_at = NOW()
-            """,
-            session_id, ticker.upper(), start_date_obj, end_date_obj
-        )
-    
-    return session_id
-
-async def fetch_filtered_market_data(ticker: str, start_date: str, end_date: str, 
-                                   session_id: str, level_price: float, tolerance: float,
-                                   job_id: Optional[str] = None) -> Dict:
-    """
-    OPTIMIZED: Fetch market data but only store trades near the specified level
-    Reduces storage by 90%+ and speeds up subsequent queries
-    """
-    if not POLYGON_API_KEY:
-        raise ValueError("POLYGON_API_KEY not set")
-    
-    # Convert dates (like backfill.py)
-    start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-    end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
-    
-    start_timestamp = int(start_dt.timestamp() * 1000000000)
-    end_timestamp = int(end_dt.timestamp() * 1000000000)
-    
-    base_url = (
-        f"https://api.polygon.io/v3/trades/{ticker.upper()}"
-        f"?timestamp.gte={start_timestamp}&timestamp.lte={end_timestamp}&limit=50000"
-    )
-    url = f"{base_url}&apiKey={POLYGON_API_KEY}"
-    
-    logger.info(f"📊 Filtered fetch for {ticker} (level ${level_price:.2f})")
-    
-    total_saved = 0
-    api_calls = 0
-    
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        while url:
-            api_calls += 1
-            logger.info(f"📡 Filtered fetch page {api_calls} for {ticker}")
-            
-            try:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e:
-                logger.error(f"Fetch error: {e}")
-                break
-            
-            results = data.get("results", [])
-            if not results:
-                break
-            
-            # Save only filtered trades (much faster)
-            saved_this_page = await batch_save_filtered_trades(
-                results, ticker, start_date, end_date, session_id,
-                level_price, tolerance
-            )
-            total_saved += saved_this_page
-            
-            logger.info(f"💾 Saved {saved_this_page} filtered trades (total {total_saved})")
-            
-            # Update job progress
-            if job_id and job_id in jobs_db:
-                progress = min(20 + (api_calls * 10), 90)
-                jobs_db[job_id]['progress'] = progress
-            
-            # Check for next page
-            next_url = data.get('next_url')
-            if next_url:
-                url = f"{next_url}&apiKey={POLYGON_API_KEY}"
-                await asyncio.sleep(0.1)
-            else:
-                break
-            
-            if api_calls >= 200:
-                logger.warning("Reached API call limit")
-                break
-    
-    # Update session
-    await update_fetch_session(session_id, total_saved, api_calls, 'completed')
-    
-    return {
-        'total_trades_fetched': total_saved,
-        'total_api_calls': api_calls,
-        'session_id': session_id,
-        'status': 'completed',
-        'method': 'filtered_fetch'
-    }
-
-async def update_fetch_session(session_id: str, total_trades: int, api_calls: int, 
-                              status: str, error_message: Optional[str] = None):
-    """Update fetch session status in SD database"""
-    if sd_db_pool is None:
-        raise RuntimeError("SD database pool not initialized")
-    
-    async with sd_db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE fetch_sessions 
-            SET total_trades_fetched = $1, total_api_calls = $2, status = $3, 
-                error_message = $4, completed_at = NOW()
-            WHERE id = $5
-            """,
-            total_trades, api_calls, status, error_message, session_id
-        )
-
-# ─── OPTIMIZED BACKGROUND JOB PROCESSING ─────────────────────────
-
-async def optimized_market_data_job(job_id: str, ticker: str, level_price: float,
-                                  start_date: str, end_date: str, tolerance: float,
-                                  level_id: Optional[int] = None, is_absorption: bool = False):
-    """
-    OPTIMIZED: Background job using backfill.py efficiency patterns
-    10-20x faster than original implementation
-    """
-    try:
-        analysis_type = "absorption" if is_absorption else "volume"
-        logger.info(f"🎯 Starting OPTIMIZED {analysis_type} job {job_id} for {ticker} at ${level_price:.2f}")
+        logger.info(f"🔥 Starting ENHANCED absorption job {job_id} for {ticker} at ${level_price:.2f}")
         
         # Update job status
-        jobs_db[job_id]['status'] = 'starting_optimized_calculation'
+        jobs_db[job_id]['status'] = 'starting_enhanced_absorption'
         jobs_db[job_id]['progress'] = 10
         await update_job_in_db(job_id)
         
-        if not is_absorption:
-            # For original volume: Try fast calculation first (no database storage)
-            try:
-                logger.info(f"🚀 Attempting fast calculation for {ticker}")
-                jobs_db[job_id]['status'] = 'fast_calculation_in_progress'
-                jobs_db[job_id]['progress'] = 30
-                await update_job_in_db(job_id)
-                
-                result = await fast_calculate_level_volume(
-                    ticker, level_price, start_date, end_date, tolerance
-                )
-                
-                jobs_db[job_id]['status'] = 'fast_calculation_completed'
-                jobs_db[job_id]['progress'] = 85
-                await update_job_in_db(job_id)
-                
-                logger.info(f"⚡ Fast method completed: {result['total_trades']:,} trades, {result['api_calls_made']} API calls")
-                
-            except Exception as e:
-                logger.warning(f"Fast method failed, checking for cached data: {e}")
-                
-                # Fall back to checking cached data
-                availability = await check_data_availability(ticker, start_date, end_date)
-                
-                if availability['has_data']:
-                    logger.info(f"📋 Using cached data ({availability['total_trades']:,} trades)")
-                    result = await calculate_level_volume_from_cache(
-                        ticker, level_price, start_date, end_date, tolerance
-                    )
-                else:
-                    logger.info(f"🌐 No cache available, using filtered fetch")
-                    # Create session and do filtered fetch
-                    session_id = await create_fetch_session(ticker, start_date, end_date)
-                    fetch_result = await fetch_filtered_market_data(
-                        ticker, start_date, end_date, session_id, level_price, tolerance, job_id
-                    )
-                    
-                    result = await calculate_level_volume_from_cache(
-                        ticker, level_price, start_date, end_date, tolerance
-                    )
-                    result['api_calls_made'] = fetch_result['total_api_calls']
-        else:
-            # For absorption: Fetch fresh data for the new time period
-            logger.info(f"🔥 Absorption analysis - fetching data for new time period")
-            availability = await check_data_availability(ticker, start_date, end_date)
+        # Use unlimited API calculation
+        logger.info(f"🌐 Fetching unlimited data for absorption period")
+        jobs_db[job_id]['status'] = 'unlimited_fetch_in_progress'
+        jobs_db[job_id]['progress'] = 30
+        await update_job_in_db(job_id)
+        
+        try:
+            result = await unlimited_fast_calculate_level_volume(
+                ticker, level_price, start_date, end_date, tolerance
+            )
+            logger.info(f"⚡ UNLIMITED absorption calculation: {result['total_trades']:,} trades, {result['api_calls_made']} API calls")
             
+        except Exception as e:
+            logger.warning(f"Unlimited method failed for absorption: {e}")
+            # Fall back to cache if available
+            availability = await check_data_availability(ticker, start_date, end_date)
             if availability['has_data']:
-                logger.info(f"📋 Using cached data for absorption period ({availability['total_trades']:,} trades)")
                 result = await calculate_level_volume_from_cache(
                     ticker, level_price, start_date, end_date, tolerance
                 )
             else:
-                logger.info(f"🌐 Fetching fresh data for absorption analysis")
-                try:
-                    # Try fast calculation first for absorption period
-                    result = await fast_calculate_level_volume(
-                        ticker, level_price, start_date, end_date, tolerance
-                    )
-                    logger.info(f"⚡ Fast absorption calculation completed: {result['total_trades']:,} trades")
-                except Exception as e:
-                    logger.warning(f"Fast method failed for absorption, using filtered fetch: {e}")
-                    # Fall back to filtered fetch
-                    session_id = await create_fetch_session(ticker, start_date, end_date)
-                    fetch_result = await fetch_filtered_market_data(
-                        ticker, start_date, end_date, session_id, level_price, tolerance, job_id
-                    )
-                    
-                    result = await calculate_level_volume_from_cache(
-                        ticker, level_price, start_date, end_date, tolerance
-                    )
-                    result['api_calls_made'] = fetch_result['total_api_calls']
+                raise e
         
-        # Update level tracking (same as before)
+        jobs_db[job_id]['status'] = 'updating_level_and_segments'
+        jobs_db[job_id]['progress'] = 85
+        await update_job_in_db(job_id)
+        
+        # Update level tracking with absorption data
+        await update_level_volume_tracking(
+            level_id, ticker, level_price, result, tolerance, 
+            start_date, end_date, is_absorption=True
+        )
+        
+        # CREATE ABSORPTION JOB SEGMENT
+        await create_absorption_job_segment(
+            level_id, job_id, result, start_date, end_date
+        )
+        
+        result['level_id'] = level_id
+        result['level_updated'] = True
+        result['segment_created'] = True
+        result['analysis_type'] = 'absorption'
+        result['job_segment_id'] = job_id
+        result['absorption_end_date'] = end_date  # Track the correct end date
+        
+        # Mark as completed
+        jobs_db[job_id]['status'] = 'completed'
+        jobs_db[job_id]['progress'] = 100
+        jobs_db[job_id]['api_calls_used'] = result['api_calls_made']
+        jobs_db[job_id]['result'] = {
+            'market_data': result,
+            'message': f'ENHANCED Absorption analysis completed: {result["total_trades"]:,} trades analyzed with unlimited API calls'
+        }
+        await update_job_in_db(job_id)
+        
+        logger.info(f"✅ ENHANCED absorption job {job_id} completed: {result['total_trades']:,} trades, segment created")
+        
+    except Exception as e:
+        logger.error(f"❌ ENHANCED absorption job {job_id} failed: {e}")
+        jobs_db[job_id]['status'] = 'failed'
+        jobs_db[job_id]['error'] = str(e)
+        await update_job_in_db(job_id)
+
+async def enhanced_volume_job(job_id: str, ticker: str, level_price: float,
+                            start_date: str, end_date: str, tolerance: float,
+                            level_id: Optional[int] = None):
+    """Enhanced volume job with unlimited API calls"""
+    try:
+        logger.info(f"🎯 Starting ENHANCED volume job {job_id} for {ticker} at ${level_price:.2f}")
+        
+        # Update job status
+        jobs_db[job_id]['status'] = 'starting_enhanced_volume'
+        jobs_db[job_id]['progress'] = 10
+        await update_job_in_db(job_id)
+        
+        # Use unlimited fast calculation
+        jobs_db[job_id]['status'] = 'unlimited_calculation_in_progress'
+        jobs_db[job_id]['progress'] = 30
+        await update_job_in_db(job_id)
+        
+        try:
+            result = await unlimited_fast_calculate_level_volume(
+                ticker, level_price, start_date, end_date, tolerance
+            )
+            logger.info(f"⚡ UNLIMITED volume calculation: {result['total_trades']:,} trades, {result['api_calls_made']} API calls")
+            
+        except Exception as e:
+            logger.warning(f"Unlimited volume method failed, checking cache: {e}")
+            availability = await check_data_availability(ticker, start_date, end_date)
+            if availability['has_data']:
+                result = await calculate_level_volume_from_cache(
+                    ticker, level_price, start_date, end_date, tolerance
+                )
+            else:
+                raise e
+        
+        # Update level tracking
         target_level_id = level_id
         if not target_level_id:
             target_level_id = await find_level_by_ticker_and_price(ticker, level_price, 0.10)
         
         if target_level_id:
-            action = "absorption data" if is_absorption else "volume data"
-            logger.info(f"🔄 Updating level {target_level_id} with {action}")
+            logger.info(f"🔄 Updating level {target_level_id} with volume data")
             await update_level_volume_tracking(
                 target_level_id, ticker, level_price, result, tolerance, 
-                start_date, end_date, is_absorption
+                start_date, end_date, is_absorption=False
             )
             result['level_id'] = target_level_id
             result['level_updated'] = True
-            result['analysis_type'] = analysis_type
         else:
             logger.warning(f"⚠️ No matching level found for {ticker} ${level_price:.2f}")
             result['level_updated'] = False
-            result['analysis_type'] = analysis_type
+        
+        result['analysis_type'] = 'volume'
         
         # Mark as completed
         jobs_db[job_id]['status'] = 'completed'
         jobs_db[job_id]['progress'] = 100
+        jobs_db[job_id]['api_calls_used'] = result['api_calls_made']
         jobs_db[job_id]['result'] = {
             'market_data': result,
-            'message': f'OPTIMIZED {analysis_type.title()} calculation completed: {result["total_trades"]:,} trades analyzed'
+            'message': f'ENHANCED Volume calculation completed: {result["total_trades"]:,} trades analyzed with unlimited API calls'
         }
         await update_job_in_db(job_id)
         
-        logger.info(f"✅ OPTIMIZED job {job_id} completed: {result['total_trades']:,} trades, {result['total_volume']:,} volume at ${level_price:.2f}")
+        logger.info(f"✅ ENHANCED volume job {job_id} completed: {result['total_trades']:,} trades")
         
     except Exception as e:
-        logger.error(f"❌ OPTIMIZED job {job_id} failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"❌ ENHANCED volume job {job_id} failed: {e}")
         jobs_db[job_id]['status'] = 'failed'
         jobs_db[job_id]['error'] = str(e)
         await update_job_in_db(job_id)
@@ -1055,9 +1054,9 @@ async def optimized_market_data_job(job_id: str, ticker: str, level_price: float
 # ─── FASTAPI APP CREATION ────────────────────────────────────────
 
 app = FastAPI(
-    title="OPTIMIZED Unified Dark Pool & SD API",
-    description="Both lit/dp and SD functionality with 10-20x faster volume jobs",
-    version="16.2.0-CLEAN",
+    title="ENHANCED Unified Dark Pool & SD API",
+    description="Enhanced with unlimited API calls, job segments, and segmented timeline visualization",
+    version="20.0.0-ENHANCED",
     lifespan=lifespan
 )
 
@@ -1074,21 +1073,19 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {
-        "message": "OPTIMIZED Unified API - 10-20x faster volume jobs using backfill.py patterns",
-        "version": "16.2.0-CLEAN",
-        "optimizations": [
-            "Fast memory-only volume calculation",
-            "Filtered data storage (90% less DB usage)",
-            "psycopg2 batch operations like backfill.py",
-            "Immediate price filtering during API fetch",
-            "FIXED: JSON serialization for job persistence",
-            "CLEAN: Removed undefined function references"
+        "message": "ENHANCED Unified API with Segmented Timeline Visualization",
+        "version": "20.0.0-ENHANCED",
+        "enhancements": [
+            "Unlimited Polygon API calls for complete data coverage",
+            "Job segments for detailed absorption timeline tracking",
+            "Supply/demand color differentiation in visualizations",
+            "Correct end date display for absorption periods",
+            "Enhanced database schema with job segments"
         ],
         "databases": {
             "darkpool_data": "Original lit/dp data (UNCHANGED)",
-            "supply_demand_data": "SD analysis data (OPTIMIZED)"
-        },
-        "performance": "Based on backfill.py efficiency patterns"
+            "supply_demand_data": "Enhanced SD analysis with segments"
+        }
     }
 
 @app.get("/health")
@@ -1098,8 +1095,15 @@ async def health_check():
         "darkpool_db": DARKPOOL_DB_NAME,
         "sd_db": SD_DB_NAME,
         "unified": True,
-        "optimized": True,
-        "version": "16.2.0-CLEAN"
+        "enhanced": True,
+        "features": [
+            "unlimited_api_calls",
+            "job_segments",
+            "segmented_timeline_visualization",
+            "supply_demand_color_coding",
+            "correct_date_semantics"
+        ],
+        "version": "20.0.0-ENHANCED"
     }
 
 # ─── ORIGINAL DARKPOOL ENDPOINTS (UNCHANGED) ─────────────────────
@@ -1149,7 +1153,7 @@ def get_all_dark_pool(ticker: str, percentile: float = Query(0.98, ge=0, le=1)):
 @app.get("/dp/bigprints", response_model=List[BlockTrade], summary="Top block trades by value")
 def get_dp_big_prints(
     days: int = Query(1, ge=1, le=30),
-    market_hours_only: bool = Query(False, description="Only show trades during market hours (9:30 AM - 4:00 PM ET)")
+    market_hours_only: bool = Query(False)
 ):
     return big_prints_query('block_trades', days, market_hours_only=market_hours_only)
 
@@ -1179,11 +1183,11 @@ def get_all_lit(ticker: str, percentile: Optional[float] = Query(None, ge=0, le=
 def get_lit_big_prints(
     days: int = Query(1, ge=1, le=30), 
     under_400m: bool = False,
-    market_hours_only: bool = Query(False, description="Only show trades during market hours (9:30 AM - 4:00 PM ET)")
+    market_hours_only: bool = Query(False)
 ):
     return big_prints_query('lit_trades', days, under_400m, market_hours_only)
 
-# ─── OPTIMIZED SD ENDPOINTS ──────────────────────────────────────
+# ─── ENHANCED SD ENDPOINTS ────────────────────────────────────────
 
 @app.post("/levels/create")
 async def create_level(level: Level):
@@ -1194,11 +1198,12 @@ async def create_level(level: Level):
         )
         
         return {
-            'message': 'Level created successfully',
+            'message': 'Enhanced level created successfully',
             'level_id': level_id,
             'ticker': level.ticker.upper(),
             'level_price': level.level_price,
-            'level_type': level.level_type
+            'level_type': level.level_type,
+            'features': ['unlimited_api_support', 'job_segments', 'timeline_visualization']
         }
         
     except Exception as e:
@@ -1218,44 +1223,121 @@ async def get_levels(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/market-volume-job/{ticker}")
-async def start_optimized_market_volume_job(
+@app.get("/levels/{ticker}/enhanced-timeline")
+async def get_enhanced_levels_for_timeline(ticker: str):
+    """Get SD levels with enhanced data including job segments for timeline visualization"""
+    try:
+        levels = await get_enhanced_sd_levels_for_timeline(ticker)
+        
+        return {
+            'ticker': ticker.upper(),
+            'levels': levels,
+            'level_count': len(levels),
+            'supply_count': len([l for l in levels if l['level']['level_type'] == 'supply']),
+            'demand_count': len([l for l in levels if l['level']['level_type'] == 'demand']),
+            'enhanced_features': [
+                'Job segments for absorption tracking',
+                'Correct end date display',
+                'Unlimited API call support',
+                'Supply/demand color schemes'
+            ]
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Keep the existing timeline endpoint for backward compatibility
+@app.get("/levels/{ticker}/timeline")
+async def get_levels_for_timeline_legacy(ticker: str):
+    """Legacy timeline endpoint - redirects to enhanced version"""
+    return await get_enhanced_levels_for_timeline(ticker)
+
+@app.delete("/levels/{level_id}")
+async def delete_level(level_id: int):
+    """Delete a supply/demand level and all associated data"""
+    try:
+        result = await delete_sd_level(level_id)
+        return {
+            'message': f'Enhanced level {level_id} deleted successfully',
+            'deleted_level': result
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete enhanced level: {str(e)}")
+
+@app.put("/levels/{level_id}/deactivate")
+async def deactivate_level(level_id: int):
+    """Deactivate a level (soft delete - keeps data but hides from lists)"""
+    if sd_db_pool is None:
+        raise HTTPException(status_code=500, detail="SD database pool not initialized")
+    
+    try:
+        async with sd_db_pool.acquire() as conn:
+            level_info = await conn.fetchrow(
+                "SELECT ticker, level_price, level_type FROM supply_demand_levels WHERE id = $1",
+                level_id
+            )
+            
+            if not level_info:
+                raise HTTPException(status_code=404, detail=f"Level {level_id} not found")
+            
+            await conn.execute(
+                "UPDATE supply_demand_levels SET is_active = false WHERE id = $1",
+                level_id
+            )
+            
+            return {
+                'message': f'Enhanced level {level_id} deactivated successfully',
+                'level_id': level_id,
+                'ticker': level_info['ticker'],
+                'level_price': float(level_info['level_price']),
+                'status': 'deactivated'
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to deactivate level: {str(e)}")
+
+
+@app.get("/market-volume-job-enhanced/{ticker}")
+async def start_enhanced_market_volume_job(
     background_tasks: BackgroundTasks,
     ticker: str,
     level_price: float = Query(...),
     start_date: str = Query(...),
     end_date: str = Query(...),
     price_tolerance: float = Query(0.025),
-    level_id: Optional[int] = Query(None, description="Level ID to update (optional)"),
+    level_id: Optional[int] = Query(None, description="Level ID to update (required for absorption)"),
     is_absorption: bool = Query(False, description="Whether this is absorption analysis")
 ):
-    """
-    OPTIMIZED: Start comprehensive market volume job with 10-20x performance improvement
-    Uses backfill.py efficiency patterns for much faster processing
-    """
+    """Enhanced market volume job with unlimited API calls and job segments"""
+    
+    # Validate that level_id is provided for absorption analysis
+    if is_absorption and level_id is None:
+        raise HTTPException(
+            status_code=400, 
+            detail="level_id is required for absorption analysis. Please provide a valid level_id."
+        )
+    
     job_id = str(uuid.uuid4())
     
-    # Check data availability for better time estimates
+    # Check data availability for estimates
     availability = await check_data_availability(ticker, start_date, end_date)
     
-    # Calculate estimated time (much faster now)
-    if not is_absorption and availability.get('has_data', False):
-        estimated_time = "2-5 seconds (using optimized fast calculation or cache)"
-        complexity = "optimized_fast"
-    elif availability.get('has_data', False):
-        estimated_time = "2-5 seconds (cached data available)"
-        complexity = "cache_lookup_optimized"
+    # Enhanced time estimates for unlimited API calls
+    if not is_absorption:
+        estimated_time = "30 seconds - 10 minutes (unlimited API calls for maximum coverage)"
+        complexity = "enhanced_unlimited_volume"
     else:
-        days = (datetime.strptime(end_date, '%Y-%m-%d') - datetime.strptime(start_date, '%Y-%m-%d')).days
-        estimated_time = f"30 seconds - 5 minutes (fetching {days} days with filtering)"
-        complexity = "filtered_fetch_optimized"
+        estimated_time = "30 seconds - 10 minutes (unlimited absorption analysis with segment creation)"
+        complexity = "enhanced_unlimited_absorption"
     
     analysis_type = "absorption" if is_absorption else "volume"
     
-    # Initialize job status
+    # Initialize enhanced job status
     jobs_db[job_id] = {
         'job_id': job_id,
-        'status': 'starting_optimized',
+        'status': 'starting_enhanced',
         'progress': 0,
         'created_at': datetime.now().isoformat(),
         'ticker': ticker.upper(),
@@ -1266,35 +1348,57 @@ async def start_optimized_market_volume_job(
         'estimated_time': estimated_time,
         'analysis_type': analysis_type,
         'is_absorption': is_absorption,
-        'optimization': 'backfill_patterns_applied'
+        'enhancement': 'unlimited_api_calls_with_segments',
+        'api_calls_used': 0
     }
     
     # Save job to database
     await save_job_to_db(job_id, jobs_db[job_id])
     
-    # Start optimized background task
-    background_tasks.add_task(
-        optimized_market_data_job, 
-        job_id, ticker, level_price, start_date, end_date, price_tolerance, level_id, is_absorption
-    )
+    # Start enhanced background task
+    if is_absorption:
+        # At this point, level_id is guaranteed to be not None due to validation above
+        background_tasks.add_task(
+            enhanced_absorption_job, 
+            job_id, ticker, level_price, start_date, end_date, price_tolerance, level_id  # type: ignore
+        )
+    else:
+        background_tasks.add_task(
+            enhanced_volume_job, 
+            job_id, ticker, level_price, start_date, end_date, price_tolerance, level_id
+        )
     
     return {
         'job_id': job_id,
-        'status': 'started_optimized',
+        'status': 'started_enhanced',
         'estimated_time': estimated_time,
         'complexity': complexity,
         'data_availability': availability,
         'analysis_type': analysis_type,
-        'optimization': 'Backfill.py patterns applied - 10-20x faster'
+        'enhancement': 'Unlimited Polygon API calls + Job segments + Correct date handling + Supply/demand visualization'
     }
 
 @app.get("/jobs/{job_id}/status")
 async def get_job_status(job_id: str):
-    """Get status of an optimized background job"""
+    """Get status of an enhanced background job"""
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Job not found")
     
     return jobs_db[job_id]
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a background job"""
+    try:
+        result = await delete_job_and_data(job_id)
+        return {
+            'message': f'Enhanced job {job_id} deleted successfully',
+            'deleted_job': result
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete job: {str(e)}")
 
 @app.post("/jobs/{job_id}/link-to-level")
 async def link_job_to_level(job_id: str, request: LinkJobRequest):
@@ -1320,11 +1424,11 @@ async def link_job_to_level(job_id: str, request: LinkJobRequest):
     analysis_type = "absorption" if is_absorption else "volume"
     
     return {
-        'message': f'Job {job_id} successfully linked to level {request.level_id} as {analysis_type} data',
+        'message': f'Enhanced job {job_id} successfully linked to level {request.level_id} as {analysis_type} data',
         'level_id': request.level_id,
         'volume_data': result,
         'analysis_type': analysis_type,
-        'optimization': 'Processed with backfill.py efficiency patterns'
+        'enhancement': 'Processed with unlimited API calls and enhanced features'
     }
 
 @app.get("/data-availability/{ticker}")
@@ -1349,20 +1453,20 @@ async def get_database_status():
         'sd_db': {
             'name': SD_DB_NAME,
             'connected': sd_db_pool is not None,
-            'type': 'asyncpg'
+            'type': 'asyncpg_enhanced'
         },
         'sd_sync_db': {
             'name': SD_DB_NAME + '_sync',
             'connected': sd_sync_pool is not None,
-            'type': 'psycopg2_batch_optimized'
+            'type': 'psycopg2_batch_enhanced'
         },
-        'optimizations': [
-            'Fast memory-only calculation',
-            'Filtered data storage',
-            'Batch operations like backfill.py',
-            'Multiple connection pool types',
-            'FIXED: JSON serialization for job persistence',
-            'CLEAN: All undefined functions resolved'
+        'enhancements': [
+            'Unlimited API call support',
+            'Job segments for timeline tracking',
+            'Supply/demand color differentiation',
+            'Correct absorption date semantics',
+            'Enhanced timeline visualization',
+            'Improved connection pooling'
         ]
     }
     
@@ -1386,16 +1490,20 @@ async def get_database_status():
         except Exception as e:
             status['darkpool_db']['error'] = str(e)
     
-    # Get SD stats
+    # Get enhanced SD stats
     if sd_db_pool:
         try:
             async with sd_db_pool.acquire() as conn:
                 level_count = await conn.fetchval("SELECT COUNT(*) FROM supply_demand_levels WHERE is_active = true")
                 cache_count = await conn.fetchval("SELECT COUNT(*) FROM market_data_cache")
+                job_count = await conn.fetchval("SELECT COUNT(*) FROM background_jobs")
+                segment_count = await conn.fetchval("SELECT COUNT(*) FROM absorption_job_segments")
                 
                 status['sd_db']['stats'] = {
                     'active_levels': level_count,
-                    'cached_trades': cache_count
+                    'cached_trades': cache_count,
+                    'tracked_jobs': job_count,
+                    'absorption_segments': segment_count
                 }
         except Exception as e:
             status['sd_db']['error'] = str(e)
